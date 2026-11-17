@@ -7,7 +7,13 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -251,7 +257,7 @@ def ar_sconv_norm_fusable(
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV_NORM.get()
     ):
         return False
-    if get_server_args().enable_scattered_sconv:
+    if get_exec().comm.enable_scattered_sconv:
         # The decode {AR -> sconv -> norm} fusion is full-width; under scattered
         # sconv the output sconvs are hidden-sharded, so it does not apply.
         return False
@@ -359,7 +365,7 @@ def ar_sconv_norm_fused(
             activation=sconv.activation,
             use_residual=sconv.use_residual,
             track_mask=forward_batch.mamba_track_mask,
-            track_indices=forward_batch.mamba_track_indices,
+            track_indices=sconv._conv_state(forward_batch).track_cache_indices,
             shared=shared,
         )
     res.v5_cur = 1 - cur
@@ -396,7 +402,7 @@ def get_ar_buffer(
         envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         # Scattered sconv replaces the AR with reduce_scatter_hidden, which
         # stages from comm.buffer[:n] -- never hand out the v4 region there.
-        and not get_server_args().enable_scattered_sconv
+        and not get_exec().comm.enable_scattered_sconv
     ):
         res = _get_inkling_ar_resources(comm)
         if (
@@ -455,9 +461,12 @@ def symm_mem_all_reduce(
     ):
         n = input.numel()
         num_tokens = input.shape[0] if input.dim() >= 2 else n
+        # select_ar_config() keys off the token count; plain multimem below
+        # reduces in a shape-independent order.
         res = (
             _get_inkling_ar_resources(comm)
             if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
+            and not get_exec().deterministic.enable_deterministic_inference
             else None
         )
         # Custom kernels need a 16B-vector-multiple size (validate() enforces it);
@@ -696,7 +705,7 @@ def scattered_ar_sconv_fusable(
     if not is_cuda():
         return False
     if not (
-        get_server_args().enable_scattered_sconv
+        get_exec().comm.enable_scattered_sconv
         and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
     ):
@@ -707,10 +716,9 @@ def scattered_ar_sconv_fusable(
     if not (fm.is_extend() or fm.is_decode()):
         return False
     # Prefill scope: the BCG runner's eager-break sites are not wired (its
-    # baked flags would disagree with the break bodies) and tc_piecewise's
-    # FX pieces can't carry the cross-layer producer/consumer contract, so
-    # both fall back to the unfused chain. The FULL prefill CUDA-graph
-    # backend (context.full_graph -- the whole model captured uniformly) IS
+    # baked flags would disagree with the break bodies), so it falls back
+    # to the unfused chain. The FULL prefill CUDA-graph
+    # backend (the whole model captured uniformly) IS
     # supported: the kernel is capture-safe (barrier epochs advance across
     # replays; validated capture+replay) and all its metadata (qsl/si/
     # cache_mask/safe_idx/track rows) is recomputed in-graph from the
@@ -718,12 +726,12 @@ def scattered_ar_sconv_fusable(
     # rows only write pad rows of the OUT region (the eager tail slices
     # [:raw]), and sentinel request slots have qlen == 0 so the in-kernel
     # cache update/track skip them.
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
 
-    tc_ctx = get_tc_piecewise_forward_context()
-    if tc_ctx is not None and not tc_ctx.full_graph:
+    if (
+        is_in_prefill_graph_scope()
+        and is_in_breakable_cuda_graph()
+        and fm.is_extend_without_speculative()
+    ):
         return False
     comm = group.torch_symm_mem_comm
     if (
@@ -831,7 +839,7 @@ def ar_scattered_sconv_fused(
     if fm.is_decode() and forward_batch.mamba_track_mask is not None:
         b = forward_batch.batch_size
         track_mask = forward_batch.mamba_track_mask[:b]
-        track_dst = forward_batch.mamba_track_indices[:b]
+        track_dst = sconv._conv_state(forward_batch).track_cache_indices[:b]
         track_from_cache = True
 
     esz = comm.buffer.element_size()
@@ -1003,7 +1011,7 @@ def ar_scattered_sconv_fused(
         **norm_kwargs,
     )
     if is_verify:
-        # Save the per-position windows for update_conv_state_after_mtp_verify.
+        # Save the per-position windows for the backend's MTP-verify commit.
         sconv.verify_fused_ar_finish(forward_batch, x_scratch, cache_indices)
     if norm is not None:
         return norm_kwargs["norm_out"], norm_residual
@@ -1033,7 +1041,7 @@ def fullwidth_ar_sconv_fusable(
     if not is_cuda():
         return False
     if not (
-        not get_server_args().enable_scattered_sconv
+        not get_exec().comm.enable_scattered_sconv
         and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
     ):
@@ -1047,15 +1055,11 @@ def fullwidth_ar_sconv_fusable(
         return False
     if num_tokens < _INKLING_AR_FW_MIN_TOKENS:
         return False
-    # Same prefill-runner scope as the scattered gate: BCG / tc_piecewise
+    # Same prefill-runner scope as the scattered gate: BCG
     # pieces can't carry the cross-layer producer contract; the FULL prefill
     # CUDA-graph backend is supported (capture-safe kernel, in-graph metadata).
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
 
-    tc_ctx = get_tc_piecewise_forward_context()
-    if tc_ctx is not None and not tc_ctx.full_graph:
+    if is_in_prefill_graph_scope() and is_in_breakable_cuda_graph():
         return False
     comm = group.torch_symm_mem_comm
     if (

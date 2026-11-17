@@ -6,6 +6,14 @@ if [ ! -f "${sglang_source_path}/${test_case}" ];then
   exit 0
 fi
 
+# Leave the image WORKDIR (/sgl-workspace): the sglang repo cloned there can
+# shadow the installed package on sys.path.
+cd "${sglang_source_path}"
+
+# CI hosts mount /root/.cache/huggingface read-only, but --trust-remote-code
+# needs a writable transformers dynamic-module cache.
+export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
+
 echo "NPU info:"
 npu-smi info
 
@@ -34,7 +42,7 @@ if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
     echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} locally."
     TRANSFORMERS_PKG_PATH_TARGET=/tmp/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
     mkdir -p "${TRANSFORMERS_PKG_PATH_TARGET}"
-    cp "${TRANSFORMERS_PKG_PATH_SOURCE}/*" "${TRANSFORMERS_PKG_PATH_TARGET}/"
+    cp "${TRANSFORMERS_PKG_PATH_SOURCE}/"* "${TRANSFORMERS_PKG_PATH_TARGET}/"
     pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
   fi
   echo "===== Install transformers for sglang in virtual env - End ====="
@@ -74,6 +82,13 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
+# Prefer the sgl-router CI built for this commit over the image's copy.
+sgl_router_bin="${sglang_source_path}/sgl-router-bin/sgl-router"
+if "${sgl_router_bin}" --help >/dev/null 2>&1; then
+    export SGLANG_TEST_PD_ROUTER_BINARY="${sgl_router_bin}"
+fi
+echo "sgl-router: $(command -v "${SGLANG_TEST_PD_ROUTER_BINARY:-sgl-router}" || echo 'not found')"
+
 export SGLANG_TEST_MAX_RETRY=0
 export SGLANG_SET_CPU_AFFINITY=1
 export HCCL_HOST_SOCKET_PORT_RANGE="auto"
@@ -94,30 +109,28 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# use sglang from source or from image
-if [ "${INSTALL_SGLANG_FROM_SOURCE}" = "true" ] || [ "${INSTALL_SGLANG_FROM_SOURCE}" = "True" ];then
-    echo "Use sglang from source: ${sglang_source_path}"
-    export PYTHONPATH=${sglang_source_path}/python:$PYTHONPATH
-else
-    echo "Use sglang from docker image"
-    sglang_pkg_path=/sgl-workspace/sglang/python
-    ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-    mkdir -p "${ascend_test_util_path}"
-    mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
-    cp -r ${sglang_source_path}/python/sglang/test/ascend "${ascend_test_util_path}"
-fi
+# Run the checkout's sglang; the image only supplies the environment.
+export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
 . /usr/local/Ascend/nnal/atb/set_env.sh
+# Adapt Deepseek-V4-Flash test cases with additional environment variables.
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
+# Additional environment variables required to enable DSPARK for Deepseek-V4 in the 950 environment
+export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so
+export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH
+export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH
 
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
 tc_name=${tc_name%.*}
-current_date=$(date +%Y%m%d)
-log_path="/root/sglang/debug/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+run_label="${RUN_LABEL:-unknown}"
+log_path="/root/sglang/debug/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
 if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-    log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+    # In CI, persist logs under /root/.cache/tests/logs so they can be collected
+    log_path="/root/.cache/tests/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
 fi
 rm -rf "${log_path}"
 mkdir -p "${log_path}"
@@ -134,6 +147,7 @@ echo "Finished test case ${test_case}"
 
 if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
+    # Archive the test log into the output directory for result collection
     cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
     echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
 fi
@@ -141,9 +155,9 @@ fi
 source_plog_path="/root/ascend/log/debug/plog"
 if [ -d "$source_plog_path" ];then
     echo "Plog files found. Begin to backup them."
-    target_plog_path="/root/sglang/debug/logs/plog/${tc_name}/${HOSTNAME}"
+    target_plog_path="/root/sglang/debug/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
     if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-        target_plog_path="/root/.cache/tests/logs/plog/${tc_name}/${HOSTNAME}"
+        target_plog_path="/root/.cache/tests/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
     fi
     rm -rf "${target_plog_path}"
     mkdir -p "${target_plog_path}"

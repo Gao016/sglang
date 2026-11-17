@@ -7,8 +7,11 @@ import subprocess
 
 from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, override_jit_cuda_arch
-from sglang.kernels.jit.utils.arch import get_default_target_flags
+from sglang.kernels.jit.utils.arch import (
+    CompileArch,
+    get_compile_arch,
+    get_default_target_flags,
+)
 from sglang.kernels.jit.utils.compile import DEFAULT_INCLUDE
 from sglang.kernels.jit.utils.deps import REGISTERED_DEPENDENCIES
 
@@ -69,29 +72,30 @@ def generate_clangd():
     if args.cuda_target:
         assert args.cuda_target.count(".") == 1
         major, minor = args.cuda_target.split(".")
-        major, minor = int(major), int(minor)
-        context = override_jit_cuda_arch(major, minor)
-        context.__enter__()
+        arch = CompileArch.for_capability(int(major), int(minor))
     else:
-        arch = get_jit_cuda_arch()
-        major, minor = arch.major, f"{arch.minor}{arch.suffix}"
-        assert (
-            major > 0
-        ), "Cannot detect CUDA architecture, please specify --cuda-target explicitly."
+        arch = get_compile_arch()
+        assert arch.major > 0, (
+            "Cannot detect CUDA architecture, please specify --cuda-target explicitly."
+        )
 
     compile_flags = [
         "-xcuda",
-        f"--cuda-gpu-arch=sm_{major}{minor}",
+        f"--cuda-gpu-arch=sm_{arch.major}{arch.minor}{arch.suffix}",
         "-Wall",
         "-Wextra",
-        *get_default_target_flags(),
+        *get_default_target_flags(arch=arch),
         *[f"-isystem{path}" for path in include_paths],
     ]
 
     # NOTE: for local clangd (fix the missing cluster related macros)
-    if major >= 9:
+    if arch.major >= 9:
         compile_flags.append("-D_CG_LIMIT_INCLUDED_DEPENDENCIES=1")
         compile_flags.append("-D_CG_HAS_CLUSTER_GROUP=1")
+
+    # NOTE: like Python's TYPE_CHECKING, set only for IDE indexing; headers use it to
+    # default the macros the JIT passes per module
+    compile_flags.append("-DSGL_TYPE_CHECKING=1")
 
     # NOTE: skip these flags because clangd don't recognize them
     UNSUPPORTED_FLAGS = {"--expt-relaxed-constexpr"}

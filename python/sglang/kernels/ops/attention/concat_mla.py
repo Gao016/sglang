@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -21,10 +26,12 @@ def _jit_concat_mla_k_module() -> Module:
 
 @cache_once
 def _jit_concat_mla_absorb_q_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         "concat_mla_absorb_q",
+        *args,
         cuda_files=["elementwise/concat_mla.cuh"],
-        cuda_wrappers=[("concat_mla_absorb_q", "ConcatMlaAbsorbQKernel::run")],
+        cuda_wrappers=[("concat_mla_absorb_q", f"ConcatMlaAbsorbQKernel<{args}>::run")],
     )
 
 
@@ -44,22 +51,28 @@ def concat_mla_k(k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor) ->
     module.concat_mla_k(k, k_nope, k_rope)
 
 
-def concat_mla_absorb_q(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def concat_mla_absorb_q(
+    a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """
     Concatenate tensors a and b for MLA absorbed Q computation.
 
     Args:
         a: Input tensor of shape [dim_0, dim_1, a_last_dim], dtype=bfloat16
         b: Input tensor of shape [dim_0, dim_1, b_last_dim], dtype=bfloat16
+        out: Optional output of shape [dim_0, dim_1, a_last_dim + b_last_dim],
+            which may be a strided view (e.g. the real heads of a head-padded
+            buffer)
 
     Returns:
         Output tensor of shape [dim_0, dim_1, a_last_dim + b_last_dim], dtype=bfloat16
     """
-    out = torch.empty(
-        (*a.shape[:-1], a.shape[-1] + b.shape[-1]),
-        dtype=a.dtype,
-        device=a.device,
-    )
+    if out is None:
+        out = torch.empty(
+            (*a.shape[:-1], a.shape[-1] + b.shape[-1]),
+            dtype=a.dtype,
+            device=a.device,
+        )
     module = _jit_concat_mla_absorb_q_module()
     module.concat_mla_absorb_q(a, b, out)
     return out

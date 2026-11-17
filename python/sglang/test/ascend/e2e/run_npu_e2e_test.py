@@ -30,7 +30,7 @@ custom_api = client.CustomObjectsApi()
 batch_api = client.BatchV1Api()
 rbac_api = client.RbacAuthorizationV1Api()
 
-LOCAL_TIMEOUT = 10800
+LOCAL_TIMEOUT = 12600
 
 script_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -308,9 +308,20 @@ def create_or_update_configmap(cm_name: str, data: dict, namespace: str):
             raise
 
 
-def prepare_cm_data(namespace, pod_string):
-    """Prepare a configmap data: {pod_name: pod_ip} by the running pod's information."""
-    pods = core_api.list_namespaced_pod(namespace=namespace)
+def prepare_cm_data(namespace, pod_string, run_id=None):
+    """Prepare a configmap data: {pod_name: pod_ip} by the running pod's information.
+
+    When run_id is provided, the label selector is scoped to that run_id so that
+    concurrent runs in the same namespace do not pollute each other's ConfigMap.
+    The pod_string filter (final_kube_job_name) still acts as a safety net.
+    """
+    if run_id:
+        label_selector = f"app=sgl-ascend,run-id={run_id}"
+    else:
+        label_selector = "app=sgl-ascend"
+    pods = core_api.list_namespaced_pod(
+        namespace=namespace, label_selector=label_selector
+    )
     data = {}
     for pod in pods.items:
         pod_name = pod.metadata.name
@@ -327,7 +338,7 @@ def monitor_pod_logs(
     monitor_pod_name = {
         KUBE_JOB_SINGLE: f"{kube_job_prefix_name}-pod-0",
         KUBE_JOB_MULTI_PD_MIX: f"{kube_job_prefix_name}-sglang-node-0",
-        KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sglang-router-0",
+        KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sgl-router-0",
     }
     pod_name = monitor_pod_name.get(kube_job_type)
 
@@ -490,6 +501,13 @@ def monitor_pod_logs(
 
 
 def generate_metrics_json(metrics_data_file, test_case, status):
+    """Collect [METRIC] lines from the log and write metrics.json.
+
+    This writes ${metrics_data_file}/metrics.json only, which feeds the
+    persistence-directory output (e.g. /root/.cache/tests/output/...).
+    It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
+    'Upload metrics' path was removed).
+    """
     log_file = os.path.join(metrics_data_file, "test_output.log")
 
     metrics = {}
@@ -516,10 +534,17 @@ def generate_metrics_json(metrics_data_file, test_case, status):
     tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
     test_type = "unknown"
+    # nightly: .../output/{branch}-{date}-{run_id}-{run_attempt}/{workflow}/{test_type}/...
+    # PR:      .../output/{test_type}/{date}/{tc_name}
+    # After `output`, rest >= 4 segments -> test_type at parts[i+3]; otherwise at parts[i+1].
     parts = metrics_data_file.split("/")
     for i, part in enumerate(parts):
-        if part == "output" and i + 1 < len(parts):
-            test_type = parts[i + 1]
+        if part == "output":
+            rest = len(parts) - (i + 1)
+            if rest >= 4:
+                test_type = parts[i + 3]
+            elif rest >= 1:
+                test_type = parts[i + 1]
             break
 
     output = {
@@ -535,10 +560,6 @@ def generate_metrics_json(metrics_data_file, test_case, status):
         json.dump(output, f, indent=2)
     logger.info(f"Metrics JSON written to {output_path}")
 
-    with open("/tmp/metrics.json", "w") as f:
-        json.dump(output, f, indent=2)
-    logger.info("Metrics JSON written to /tmp/metrics.json")
-
 
 def run_npu_e2e_test_case(
     docker_image_url: str,
@@ -550,10 +571,11 @@ def run_npu_e2e_test_case(
     metrics_data_file: str,
     test_case: str,
     sglang_is_in_ci=False,
-    install_sglang_from_source=False,
     env="debug",
     trouble_shotting=False,
     transformers_version="",
+    run_id: str = "",
+    accuracy_dataset: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -567,13 +589,32 @@ def run_npu_e2e_test_case(
         metrics_data_file (str): the output path of the metrics data file, only for performance testing.
         test_case (str): the test case relative path in sglang source root path. like test/registered/...
         sglang_is_in_ci (bool): whether running in CI environment.
-        install_sglang_from_source (bool): whether installing sglang from source or use docker image directly.
         env (str): the environment to run the test on.  Choose one in ["debug", "ci"]
+        run_id (str): the GitHub Actions run_id, used to label pods for run-scoped
+            isolation when multiple runs share the same k8s namespace.
+        accuracy_dataset (str): dataset name injected into multi-node pods as
+            NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends).
     """
     random_str = get_unique_random_string(16, True)
 
     kube_config_map = f"sglang-configmap-{random_str}"
     final_kube_job_name = f"{kube_job_name_prefix}-{random_str}"
+    # run_label is injected into the pod as RUN_LABEL to build the pod log directory prefix.
+    # nightly (>=4 segments after `output`): first two segments {branch}-{date}-{run_id}-{run_attempt}/{workflow}
+    # PR legacy layout: fall back to the date segment to keep the original {date}/{tc_name}/{host} path.
+    parts = (
+        metrics_data_file.split("/output/")[-1]
+        if "/output/" in metrics_data_file
+        else ""
+    )
+    if parts:
+        segments = parts.split("/")
+        if len(segments) >= 4:
+            run_label = "/".join(segments[:2])
+        else:
+            run_label = segments[1] if len(segments) > 1 else "unknown"
+    else:
+        run_label = "unknown"
 
     kube_yaml_file_dict = {
         KUBE_JOB_SINGLE: f"k8s_single_{random_str}.yaml",
@@ -599,10 +640,11 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
+                "run_label": run_label,
+                "run_id": run_id,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -621,10 +663,12 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
+                "run_label": run_label,
+                "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -648,10 +692,12 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
+                "run_label": run_label,
+                "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -671,7 +717,9 @@ def run_npu_e2e_test_case(
         ):
             if kube_job_type != "single":
                 matching_pod_string = final_kube_job_name
-                cm_data = prepare_cm_data(kube_name_space, matching_pod_string)
+                cm_data = prepare_cm_data(
+                    kube_name_space, matching_pod_string, run_id=run_id
+                )
                 if not cm_data:
                     logger.info(
                         f"No sglang pod found while matching {matching_pod_string}"
@@ -793,12 +841,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--install-sglang-from-source",
-        action="store_true",
-        help="Used to set env var INSTALL_SGLANG_FROM_SOURCE in pod",
-    )
-
-    parser.add_argument(
         "--kube-name-space",
         type=str,
         required=True,
@@ -842,6 +884,23 @@ if __name__ == "__main__":
         help="The transformers version number for running sglang. Use default version in image if keep empty.",
     )
 
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        required=False,
+        default="",
+        help="GitHub Actions run_id, used to label pods for run-scoped isolation.",
+    )
+
+    parser.add_argument(
+        "--accuracy-dataset",
+        type=str,
+        required=False,
+        default="",
+        help="Dataset injected into multi-node pods as NPU_ACCURACY_DATASET "
+        "(gsm8k on weekdays, gpqa_diamond on weekends).",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -854,10 +913,11 @@ if __name__ == "__main__":
     metrics_data_file = args.metrics_data_file
     test_case = args.test_case
     sglang_is_in_ci = args.sglang_is_in_ci
-    install_sglang_from_source = args.install_sglang_from_source
     env = args.env
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
+    run_id = args.run_id
+    accuracy_dataset = args.accuracy_dataset
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -883,8 +943,9 @@ if __name__ == "__main__":
         metrics_data_file=metrics_data_file,
         test_case=test_case,
         sglang_is_in_ci=sglang_is_in_ci,
-        install_sglang_from_source=install_sglang_from_source,
         env=env,
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
+        run_id=run_id,
+        accuracy_dataset=accuracy_dataset,
     )

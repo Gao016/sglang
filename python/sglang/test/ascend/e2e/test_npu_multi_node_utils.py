@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -13,6 +14,11 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    SGL_ROUTER_REQUEST_TIMEOUT_SECS,
+    find_sgl_router_binary,
+    sgl_router_command,
+)
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
 logging.basicConfig(
@@ -389,6 +395,21 @@ def _get_nnodes_from_args(args_list):
     return None
 
 
+def _is_instance_head(pod_index, is_multi_node_instance, nnodes):
+    if not is_multi_node_instance:
+        return True
+    if nnodes is not None and nnodes >= 1:
+        return pod_index % nnodes == 0
+    return pod_index == 0
+
+
+def _get_served_model_name(model_config):
+    args = model_config["prefill_args"]
+    if "--served-model-name" in args:
+        return str(args[args.index("--served-model-name") + 1])
+    return model_config["model_path"]
+
+
 def _get_pod_ip_by_keyword(configmap_data, keyword):
     for pod_name, pod_ip in configmap_data.items():
         if keyword in pod_name:
@@ -426,7 +447,12 @@ def check_role(allowed_roles: Union[str, Iterable[str]]):
 def launch_pd_mix_node(model_config):
     logger.info(f"Launch pd mix node start ......")
     host_name = get_host_name()
-    pod_index = int(host_name.rsplit("-", 1)[-1])
+    last_part = host_name.rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        raise RuntimeError(
+            f"Unexpected hostname format, expected numeric suffix: {host_name}"
+        )
+    pod_index = int(last_part)
 
     # Monitor ConfigMap to generate dist-init-addr and node-rank
     is_ready = False
@@ -497,7 +523,12 @@ def launch_pd_mix_node(model_config):
 def launch_pd_separation_node(model_config):
     logger.info(f"Launch pd separation node start ......")
     host_name = get_host_name()
-    pod_index = int(host_name.rsplit("-", 1)[-1])
+    last_part = host_name.rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        raise RuntimeError(
+            f"Unexpected hostname format, expected numeric suffix: {host_name}"
+        )
+    pod_index = int(last_part)
     role = "prefill" if "prefill" in host_name else "decode"
 
     bootstrap_init_port = BOOTSTRAP_INIT_PORT
@@ -677,31 +708,22 @@ def launch_pd_separation_node(model_config):
 
 
 # Launch router node
-def launch_router(model_config):
+def launch_router(model_config, router_binary):
     logger.info(f"launch_router start ......")
     discover_worker_nodes()
 
     # Monitor to generate prefill/decode URL
     prefill_url = []
     decode_url = []
-    bootstrap_ports = []
     node_ip_list = []
-    is_multi_node_prefill_instance = "--node-rank" not in model_config["prefill_args"]
-    is_multi_node_decode_instance = "--node-rank" not in model_config["decode_args"]
-
-    prefill_nnodes = (
-        _get_nnodes_from_args(model_config["prefill_args"])
-        if is_multi_node_prefill_instance
-        else None
-    )
-    decode_nnodes = (
-        _get_nnodes_from_args(model_config["decode_args"])
-        if is_multi_node_decode_instance
-        else None
-    )
+    roles = []
+    for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+        args = model_config[f"{role}_args"]
+        is_multi_node_instance = "--node-rank" not in args
+        nnodes = _get_nnodes_from_args(args) if is_multi_node_instance else None
+        roles.append((role, urls, is_multi_node_instance, nnodes))
 
     is_ready = False
-    bootstrap_init_port = BOOTSTRAP_INIT_PORT
     start_time = time.time()
     while not is_ready and time.time() - start_time < ROUTER_CONFIGMAP_TIMEOUT:
         configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
@@ -713,50 +735,23 @@ def launch_router(model_config):
 
         prefill_url.clear()
         decode_url.clear()
-        bootstrap_ports.clear()
         node_ip_list.clear()
 
         for pod_name, pod_ip in configmap.data.items():
-            pod_index = int(pod_name.rsplit("-", 1)[-1])
+            # Skip unexpected entries that don't end with a numeric index
+            last_part = pod_name.rsplit("-", 1)[-1]
+            if not last_part.isdigit():
+                logger.info(
+                    "Skipping ConfigMap entry with non-numeric suffix: %s", pod_name
+                )
+                continue
+            pod_index = int(last_part)
 
-            if "prefill" in pod_name:
-                if is_multi_node_prefill_instance:
-                    if prefill_nnodes is not None and prefill_nnodes > 1:
-                        if pod_index % prefill_nnodes == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(
-                                str(bootstrap_init_port + pod_index // prefill_nnodes)
-                            )
-                            node_ip_list.append(pod_ip)
-                    elif prefill_nnodes is not None and prefill_nnodes == 1:
-                        prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        bootstrap_ports.append(str(bootstrap_init_port + pod_index))
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(str(bootstrap_init_port))
-                            node_ip_list.append(pod_ip)
-                else:
-                    prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                    bootstrap_ports.append(str(bootstrap_init_port + pod_index))
-                    node_ip_list.append(pod_ip)
-
-            if "decode" in pod_name:
-                if is_multi_node_decode_instance:
-                    if decode_nnodes is not None and decode_nnodes > 1:
-                        if pod_index % decode_nnodes == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                    elif decode_nnodes is not None and decode_nnodes == 1:
-                        decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                else:
-                    decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
+            for role, urls, is_multi_node_instance, nnodes in roles:
+                if role in pod_name and _is_instance_head(
+                    pod_index, is_multi_node_instance, nnodes
+                ):
+                    urls.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
                     node_ip_list.append(pod_ip)
 
         if prefill_url and decode_url:
@@ -771,7 +766,7 @@ def launch_router(model_config):
         )
     logger.info(
         f"ConfigMap monitoring complete: prefill_url={prefill_url}, decode_url={decode_url}, "
-        f"bootstrap_ports={bootstrap_ports}, node_ip_list={node_ip_list}"
+        f"node_ip_list={node_ip_list}"
     )
 
     # Check all node port ready
@@ -783,30 +778,21 @@ def launch_router(model_config):
     # Set environment variables
     set_environment_variables(model_config.get("router_envs"))
 
-    router_args = model_config["router_args"]
-    # Router server params
-    router_command = [
-        "python3",
-        "-u",
-        "-m",
-        "sglang_router.launch_router",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(SERVICE_PORT),
-        "--pd-disaggregation",
-        "--policy",
-        "cache_aware",
-        *[str(x) for x in router_args],
-    ]
-
-    for index, url in enumerate(prefill_url):
-        router_command.extend(
-            ["--prefill", f"http://{url}", f"{bootstrap_ports[index]}"]
-        )
-
-    for url in decode_url:
-        router_command.extend(["--decode", f"http://{url}"])
+    router_args = [str(x) for x in model_config["router_args"]]
+    request_timeout_secs = SGL_ROUTER_REQUEST_TIMEOUT_SECS
+    if "--request-timeout-secs" in router_args:
+        i = router_args.index("--request-timeout-secs")
+        request_timeout_secs = router_args[i + 1]
+        del router_args[i : i + 2]
+    router_command = sgl_router_command(
+        router_binary,
+        _get_served_model_name(model_config),
+        [f"http://{url}" for url in prefill_url + decode_url],
+        host="0.0.0.0",
+        port=SERVICE_PORT,
+        request_timeout_secs=request_timeout_secs,
+        extra_args=router_args,
+    )
 
     logger.info(f"Starting router with command: {' '.join(router_command)}")
     try:
@@ -814,6 +800,24 @@ def launch_router(model_config):
         logger.info(f"Router process started with PID: {router_process.pid}")
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
+
+
+def start_router_thread(model_config, base_url):
+    logger.info(f"Starting router in thread...")
+    # Looked up here so a missing binary fails the test, not the daemon thread.
+    router_binary = find_sgl_router_binary()
+    router_thread = threading.Thread(
+        target=launch_router, args=(model_config, router_binary)
+    )
+    router_thread.daemon = True
+    router_thread.start()
+
+    # /health answers once the router listens; /readiness waits for the
+    # prefill and decode workers to be registered.
+    health_check_url = f"{base_url}/readiness"
+    logger.info(f"Waiting for router to be ready at {health_check_url}")
+    wait_server_ready(health_check_url)
+    return router_thread
 
 
 def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
@@ -944,7 +948,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")
@@ -952,7 +956,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
 
 
@@ -970,7 +974,9 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.role = (
             "router"
             if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
         cls.sglang_thread = None
@@ -987,16 +993,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["router"])
     def start_router_server(cls):
-        logger.info(f"Starting router in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_router, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
+        cls.sglang_thread = start_router_thread(cls.model_config, cls.base_url)
 
         logger.info(
             f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
@@ -1052,7 +1049,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")
@@ -1060,5 +1057,24 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
+
+
+def kill_process_group(process):
+    """SIGKILL the whole process group led by ``process.pid`` (== pgid).
+
+    ``process`` is a ``subprocess.Popen`` launched with ``start_new_session=True``,
+    so its pid equals the process-group id. A ``None`` process is ignored.
+    """
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(f"killed process group pgid={process.pid}")
+    except ProcessLookupError:
+        logger.info(f"process group pgid={process.pid} already gone")
+    except PermissionError:
+        logger.warning(f"no permission to kill process group pgid={process.pid}")
+    except OSError as e:
+        logger.warning(f"failed to kill process group pgid={process.pid}: {e}")

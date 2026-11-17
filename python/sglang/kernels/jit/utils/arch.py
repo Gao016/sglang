@@ -1,29 +1,41 @@
-"""CUDA/ROCm architecture detection and default compile target flags."""
+"""JIT compile target and default compile flags.
+
+Runtime decisions (capability, SM count, feature support) read
+`sglang.kernels.arch`; this module only decides what nvcc/hipcc compiles for.
+"""
 
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
-from dataclasses import dataclass
+import os
+import re
+import subprocess
 from typing import List
 
+import msgspec
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
     is_musa_runtime,
+    is_sail_runtime,
 )
-from sglang.srt.utils.common import get_cuda_version
+from sglang.srt.utils.device import is_cuda
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ArchInfo:
+class CompileArch(msgspec.Struct, frozen=True):
     major: int
     minor: int
     suffix: str
+
+    @classmethod
+    def for_capability(cls, major: int, minor: int) -> CompileArch:
+        """The CUDA target for an explicitly requested capability."""
+        return cls(major, minor, _cuda_arch_suffix(major, minor))
 
     @property
     def target_name(self) -> str:
@@ -34,44 +46,99 @@ class ArchInfo:
         return f"-DSGL_CUDA_ARCH={self.major * 100 + self.minor * 10}"
 
 
+@cache_once
+def _jit_cuda_version() -> tuple[int, ...]:
+    """CUDA version of the nvcc that JIT builds actually run.
+
+    The target has to match the compiler, not the toolkit PyTorch was built
+    against: a cu130 wheel on a CUDA 12.8 toolkit would otherwise select
+    `sm_120f`, which nvcc 12.8 rejects. Falls back to `torch.version.cuda` when
+    nvcc cannot be probed.
+    """
+    # toolchain imports this module at load time, so its import stays local.
+    from sglang.kernels.jit.utils.compile.toolchain import cuda_home
+
+    nvcc = os.path.join(cuda_home(), "bin", "nvcc")
+    try:
+        output = subprocess.check_output([nvcc, "--version"], text=True)
+        match = re.search(r"release (\d+)\.(\d+)", output)
+        if match is not None:
+            return int(match.group(1)), int(match.group(2))
+        logger.warning("Cannot parse `%s --version` output: %s", nvcc, output)
+    except (OSError, subprocess.SubprocessError) as error:
+        logger.warning("Cannot run `%s --version`: %s", nvcc, error)
+    from sglang.srt.utils.device import get_cuda_version
+
+    return get_cuda_version()
+
+
+def _sail_arch_suffix(major: int, minor: int) -> str:
+    """SAIL devices below the SM89 capability require the arch-specific target
+    variant for JIT compilation (the ``"a"`` suffix); SM89+ SAIL devices stay
+    unsuffixed like HIP/MUSA.
+    """
+    return "a" if (major <= 8 and minor < 9) else ""
+
+
 def _cuda_arch_suffix(major: int, minor: int) -> str:
     """Mirror FlashInfer's `_normalize_cuda_arch`: 9.x/10.x+ -> "a"; 12.0 -> "f"
     and 12.x (x>0) -> "a" (SM120/SM121 need separate cubins to avoid
-    cudaErrorIllegalInstruction, requires CUDA >= 12.9); below 9.0 -> plain.
-    Unlike FlashInfer, pre-12.9 CUDA falls back to plain instead of raising.
+    cudaErrorIllegalInstruction); below 9.0 -> plain.
+
+    The family-specific "f" target needs a CUDA >= 12.9 nvcc; older toolkits
+    fall back to "a", which SM120 has had since 12.8. Plain sm_120 is never a
+    valid fallback: without an a/f target CUTLASS's SM120 atoms lose LDSM/STSM
+    and compile down to trap stubs (verified via SASS), which asserts at launch
+    instead of failing the build.
     """
     if major == 9:
         return "a"
     if major == 12:
-        if get_cuda_version() < (12, 9):
-            return ""
-        return "f" if minor == 0 else "a"
+        if minor == 0 and _jit_cuda_version() >= (12, 9):
+            return "f"
+        return "a"
     if major >= 10:
         return "a"
     return ""
 
 
+MODULE_USES_CUTLASS = ["deep_select_topk"]
+
+
 @cache_once
-def _init_jit_cuda_arch_once():
-    global _CUDA_ARCH
+def get_compile_arch(kernel_name: str = "") -> CompileArch:
+    """The target JIT builds compile for: the local GPU, with its a/f suffix.
+
+    Only the build pipeline reads this; kernels branch on `sglang.kernels.arch`.
+    """
+    cuda = current_arch().cuda
     try:
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
+        major, minor = (
+            cuda.capability if cuda is not None else torch.cuda.get_device_capability()
+        )
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
     # JIT builds target the exact local GPU, so the arch-specific target is
     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.
-    suffix = (
-        ""
-        if (is_hip_runtime() or is_musa_runtime())
-        else _cuda_arch_suffix(major, minor)
-    )
-    _CUDA_ARCH = ArchInfo(major, minor, suffix)
+    if is_hip_runtime() or is_musa_runtime():
+        suffix = ""
+    elif is_sail_runtime():
+        suffix = _sail_arch_suffix(major, minor)
+    else:
+        suffix = _cuda_arch_suffix(major, minor)
+        if (major, minor) == (10, 7) and kernel_name in MODULE_USES_CUTLASS:
+            from flashinfer.compilation_context import cutlass_supports_sm107
+
+            if not cutlass_supports_sm107():
+                major, minor, suffix = 10, 0, "f"
+
+    return CompileArch(major, minor, suffix)
 
 
-def get_default_target_flags() -> List[str]:
+def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
+    """Default compile flags for `arch`, defaulting to the detected local GPU."""
     if is_hip_runtime():
         flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
         # Detect FP8 type based on GPU architecture
@@ -86,34 +153,22 @@ def get_default_target_flags() -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     else:
+        if arch is None:
+            arch = get_compile_arch()
         return [
-            get_jit_cuda_arch().jit_flag,
+            arch.jit_flag,
             "-std=c++20",
             "-O3",
             "--expt-relaxed-constexpr",
         ]
 
 
-@contextmanager
-def override_jit_cuda_arch(major: int, minor: int, suffix: str = ""):
-    """A context manager to temporarily override CUDA architecture."""
-    global _CUDA_ARCH
-    old_value = get_jit_cuda_arch()
-    _CUDA_ARCH = ArchInfo(major, minor, suffix)
-    try:
-        yield
-    finally:
-        _CUDA_ARCH = old_value
-
-
-def get_jit_cuda_arch() -> ArchInfo:
-    """Get the current CUDA architecture info."""
-    _init_jit_cuda_arch_once()
-    return _CUDA_ARCH
-
-
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime() or is_musa_runtime():
-        return False
-    return get_jit_cuda_arch().major >= 9
+    return current_arch().supports_pdl
+
+
+def get_activation_cuda_cflags() -> list[str]:
+    if is_cuda():
+        return ["--use_fast_math"]
+    return []

@@ -18,6 +18,8 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +45,13 @@ def _get_raw_quant_config(
 
     model_name_or_path = model_config.model_path
 
-    # A local path holds hf_quant_config.json directly; a remote HF repo id must
-    # first resolve its JSON configs from the hub (mirrors weight_utils.get_quant_config).
+    # A local path holds hf_quant_config.json directly; anything else resolves its
+    # JSON configs first. An object-storage URL is neither a directory nor a valid
+    # repo id, so it needs its own branch before snapshot_download.
     if os.path.isdir(model_name_or_path):
         hf_folder = model_name_or_path
+    elif is_runai_obj_uri(model_name_or_path):
+        hf_folder = ObjectStorageModel.download_and_get_path(model_name_or_path)
     else:
         hf_folder = snapshot_download(
             model_name_or_path,
@@ -188,11 +193,8 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
                     # forward branch in UnquantizedFusedMoEMethod). The loader's
                     # shared_w13 [up||gate] swap keys on the same predicate.
                     # Routed quant-EXCLUDED bf16 layers keep the triton runner.
-                    return UnquantizedFusedMoEMethod(
-                        use_triton_kernels=False,
-                        use_flashinfer_trtllm_moe=True,
-                    )
-                return UnquantizedFusedMoEMethod(use_triton_kernels=False)
+                    return UnquantizedFusedMoEMethod(use_flashinfer_trtllm_moe=True)
+                return UnquantizedFusedMoEMethod()
             logger.debug(f"quantizing fused MoE layer: {prefix}")
             # Upstream ModelOpt NVFP4 fused-MoE method. It de-interleaves the Inkling
             # interleaved-w13 layout when the layer sets inference_moe_w13_interleaved.
@@ -222,7 +224,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
     def maybe_from_model_config(
         cls, model_config: ModelConfig
     ) -> InklingModelOptNvfp4Config | None:
-        from sglang.srt.runtime_context import get_parallel
 
         raw_quant_config = _get_raw_quant_config(model_config)
 

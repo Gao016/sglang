@@ -7,26 +7,73 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_gfx95_supported, is_xpu
 
-from ..common.utils import _bitonic_merge, robust_allocator
-
-
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
-    }
+from ..common.tile_ptr import tile_ptrs_1d, tile_ptrs_2d
+from ..common.utils import (
+    _bitonic_merge,
+    _sort_ids_ascending,
+    check_sparse_kv_fp8,
+    robust_allocator,
+    sparse_out_dtype,
+    unit_scale,
 )
-@triton.autotune(
-    configs=[
+
+# Largest row the single-stage top-k takes: kMaxNumBlocks of sgl-kernel-xpu's own
+# kernel on XPU, else _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
+_JIT_TOPK_MAX_NUM_BLOCKS = 4096 if is_xpu() else 16384
+
+
+def _prune_decode_configs(configs, named_args, **kwargs):
+    """Drop autotune configs whose token tile is smaller than a sparse block.
+
+    BLOCKS_PER_K_BLOCK = BLOCK_SIZE_N // block_size is 0 for those, so they
+    cannot compile. Keep the full list if nothing survives (block_size larger
+    than every tile) and let triton report the real failure.
+    """
+    block_size = named_args["block_size"]
+    kept = [c for c in configs if c.kwargs["BLOCK_SIZE_N"] >= block_size]
+    return kept or list(configs)
+
+
+_ON_HIP = torch.version.hip is not None
+
+
+def _decode_score_block_n(args):
+    # gfx950 pick: 512 for tiny batches (few CTAs), else 128. A 512-token bf16
+    # K tile needs 128 KB of LDS, more than gfx942's 64 KB, so other archs keep 128.
+    small_batch = args["batch_size"] <= 4 and is_gfx95_supported()
+    return max(512 if small_batch else 128, args["block_size"])
+
+
+# On ROCm the autotune sweep is replaced by a fixed config plus the
+# BLOCK_SIZE_N heuristic above: runtime autotune can fire under CUDA-graph
+# capture and mistune.
+_DECODE_SCORE_CONFIGS = (
+    [triton.Config({}, num_warps=4, num_stages=1)]
+    if _ON_HIP
+    else [
         triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
         for BN in [64, 128, 256, 512]
         for nw in [4, 8, 16]
         for ns in [1, 2, 3]
-    ],
+    ]
+)
+
+_DECODE_SCORE_HEURISTICS = {
+    "BLOCK_SIZE_H": lambda args: max(
+        16, triton.next_power_of_2(args["gqa_group_size"])
+    ),
+    "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
+    **({"BLOCK_SIZE_N": _decode_score_block_n} if _ON_HIP else {}),
+}
+
+
+@triton.heuristics(_DECODE_SCORE_HEURISTICS)
+@triton.autotune(
+    configs=_DECODE_SCORE_CONFIGS,
     key=[
         "BATCH_SIZE_BUCKET",
         "gqa_group_size",
@@ -34,6 +81,9 @@ from ..common.utils import _bitonic_merge, robust_allocator
         "block_size",
         "SCORE_TYPE",
     ],
+    prune_configs_by=(
+        None if _ON_HIP else {"early_config_prune": _prune_decode_configs}
+    ),
 )
 @triton.jit
 def _decode_score_kernel(
@@ -53,6 +103,8 @@ def _decode_score_kernel(
     topk: tl.constexpr,
     # sm_scale
     sm_scale,
+    # per-tensor K dequant scale (1.0 when the cache is unit-scaled)
+    k_scale,
     # init and local blocks
     init_blocks,
     local_blocks,
@@ -75,6 +127,7 @@ def _decode_score_kernel(
     NUM_KV_CHUNKS: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -100,24 +153,31 @@ def _decode_score_kernel(
         return
     sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
     # init qkv pointer
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_q_h, stride_q_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+        q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+        gqa_group_size,
+        head_dim,
+        stride_q_h,
+        stride_q_d,
+        0,
+        0,
+        BLOCK_SIZE_H,
+        BLOCK_SIZE_D,
     )
-    s_ptrs = tl.make_block_ptr(
-        base=score_ptr + pid_b * stride_s_b + pid_h * stride_s_h,
-        shape=(gqa_group_size, chunk_end_block),
-        strides=(stride_s_h, stride_s_n),
-        offsets=(0, chunk_start_block),
-        block_shape=(BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK),
-        order=(1, 0),
+    s_ptrs_col = chunk_start_block
+    s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+        score_ptr + pid_b * stride_s_b + pid_h * stride_s_h,
+        gqa_group_size,
+        chunk_end_block,
+        stride_s_h,
+        stride_s_n,
+        0,
+        s_ptrs_col,
+        BLOCK_SIZE_H,
+        BLOCKS_PER_K_BLOCK,
     )
     # load q
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
     # init statistics
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)
@@ -160,11 +220,15 @@ def _decode_score_kernel(
             mask=dim_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # fp8 index K cache: widening cast with bf16/fp16 Q, no-op with fp8
+            # Q (fp8 attn-GEMM mode; tl.dot runs fp8x8). Compiled out for bf16.
+            k = k.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * sm_scale_log2e
+        qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
         # save qk to score
         score = tl.reshape(
             qk,
@@ -186,9 +250,128 @@ def _decode_score_kernel(
         score = tl.where(
             is_local[None, :], 1e29, tl.where(is_init[None, :], 1e30, score)
         )
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), mask=s_ptrs_mask)
         # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        s_ptrs_col = s_ptrs_col + BLOCKS_PER_K_BLOCK
+        s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+            score_ptr + pid_b * stride_s_b + pid_h * stride_s_h,
+            gqa_group_size,
+            chunk_end_block,
+            stride_s_h,
+            stride_s_n,
+            0,
+            s_ptrs_col,
+            BLOCK_SIZE_H,
+            BLOCKS_PER_K_BLOCK,
+        )
+
+
+@triton.jit
+def _decode_score_paged_kernel(
+    q_ptr,
+    k_cache_ptr,
+    req_to_token_ptr,
+    score_ptr,
+    seq_lens,
+    slot_ids,
+    max_slots,
+    batch_size,
+    gqa_group_size,
+    head_dim,
+    block_size: tl.constexpr,
+    topk: tl.constexpr,
+    sm_scale,
+    k_scale,
+    init_blocks,
+    local_blocks,
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_r2t_b,
+    stride_s_h,
+    stride_s_b,
+    stride_s_n,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    NUM_KV_CHUNKS: tl.constexpr,
+    SCORE_TYPE: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    # _decode_score_kernel for page_size % block_size == 0: a sparse block lies in
+    # one page, so its K rows are contiguous from the block's first slot.
+    tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
+    pid_b = pid_bc % batch_size
+    pid_c = pid_bc // batch_size
+    pid_h = pid_kh * gqa_group_size
+    seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
+    num_blocks = (seq_len + block_size - 1) // block_size
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if num_blocks <= topk:
+            return
+    chunk_size_blocks = tl.cdiv(num_blocks, NUM_KV_CHUNKS)
+    chunk_start_block = pid_c * chunk_size_blocks
+    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
+    if chunk_start_block >= chunk_end_block:
+        return
+    sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_n = tl.arange(0, block_size)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    h_mask = off_h < gqa_group_size
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_q_b
+        + (pid_h + off_h)[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d,
+        mask=h_mask[:, None] & (off_d < head_dim)[None, :],
+        other=0.0,
+    )
+    if IS_FP8:
+        q = q.to(tl.float16)
+    r2t_base = req_to_token_ptr + sid * stride_r2t_b
+    k_head = k_cache_ptr + pid_kh * stride_k_h
+    local_start = tl.maximum(0, num_blocks - local_blocks)
+    s_base = score_ptr + pid_b * stride_s_b + (pid_h + off_h) * stride_s_h
+    for blk in range(chunk_start_block, chunk_end_block):
+        tok0 = blk * block_size
+        slot0 = tl.load(r2t_base + tok0).to(tl.int64)
+        slot0 = (slot0 + max_slots) % max_slots
+        k = tl.load(
+            k_head
+            + (slot0 + off_n)[:, None] * stride_k_s
+            + off_d[None, :] * stride_k_d,
+            mask=(off_d < head_dim)[None, :],
+            other=0.0,
+        )
+        if IS_FP8:
+            k = k.to(tl.float16)
+        qk = tl.dot(q, tl.trans(k))
+        qk = tl.where((tok0 + off_n)[None, :] < seq_len, qk, float("-inf"))
+        scale = sm_scale_log2e * k_scale
+        sub_max = tl.max(qk, axis=1)
+        if SCORE_TYPE == "max":
+            score = sub_max * scale
+        else:
+            score = sub_max * scale + tl.log2(
+                tl.sum(tl.exp2((qk - sub_max[:, None]) * scale), axis=1)
+            )
+            score = tl.where(score != score, float("-inf"), score)
+        score = tl.where(
+            (blk >= local_start) & (blk < num_blocks),
+            1e29,
+            tl.where(blk < init_blocks, 1e30, score),
+        )
+        tl.store(
+            s_base + blk * stride_s_n,
+            score.to(score_ptr.dtype.element_ty),
+            mask=h_mask,
+        )
 
 
 @triton.heuristics(
@@ -214,6 +397,7 @@ def _decode_score_kernel(
         "HAS_SINK",
         "SCORE_TYPE",
     ],
+    prune_configs_by={"early_config_prune": _prune_decode_configs},
 )
 @triton.jit
 def _decode_score_attn_kernel(
@@ -237,6 +421,9 @@ def _decode_score_attn_kernel(
     topk: tl.constexpr,
     # sm_scale
     sm_scale,
+    # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
+    k_scale,
+    v_scale,
     # init and local blocks
     init_blocks,
     local_blocks,
@@ -271,6 +458,7 @@ def _decode_score_attn_kernel(
     HAS_SINK: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -295,24 +483,31 @@ def _decode_score_attn_kernel(
         tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
     ) % max_slots  # to avoid bugs when slot_ids is negative
     # init qkv pointer
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_q_h, stride_q_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+        q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+        gqa_group_size,
+        head_dim,
+        stride_q_h,
+        stride_q_d,
+        0,
+        0,
+        BLOCK_SIZE_H,
+        BLOCK_SIZE_D,
     )
-    s_ptrs = tl.make_block_ptr(
-        base=score_ptr + pid_b * stride_s_b + pid_h * stride_s_h,
-        shape=(gqa_group_size, chunk_end_block),
-        strides=(stride_s_h, stride_s_n),
-        offsets=(0, chunk_start_block),
-        block_shape=(BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK),
-        order=(1, 0),
+    s_ptrs_col = chunk_start_block
+    s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+        score_ptr + pid_b * stride_s_b + pid_h * stride_s_h,
+        gqa_group_size,
+        chunk_end_block,
+        stride_s_h,
+        stride_s_n,
+        0,
+        s_ptrs_col,
+        BLOCK_SIZE_H,
+        BLOCKS_PER_K_BLOCK,
     )
     # load q
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
     # init statistics
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)
@@ -320,17 +515,18 @@ def _decode_score_attn_kernel(
     dim_mask = off_d < head_dim
     if HAS_SINK:
         if pid_c == 0:
-            sink_ptrs = tl.make_block_ptr(
-                base=sink_ptr + pid_h * stride_sink_h,
-                shape=(gqa_group_size, head_dim),
-                strides=(stride_sink_h, stride_sink_d),
-                offsets=(0, 0),
-                block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-                order=(1, 0),
+            sink_ptrs, sink_ptrs_mask = tile_ptrs_2d(
+                sink_ptr + pid_h * stride_sink_h,
+                gqa_group_size,
+                head_dim,
+                stride_sink_h,
+                stride_sink_d,
+                0,
+                0,
+                BLOCK_SIZE_H,
+                BLOCK_SIZE_D,
             )
-            sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
-                tl.float32
-            )
+            sink = tl.load(sink_ptrs, mask=sink_ptrs_mask, other=0.0).to(tl.float32)
             qsink = (
                 tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale_log2e
             )  # (BLOCK_SIZE_H,)
@@ -367,6 +563,10 @@ def _decode_score_attn_kernel(
             mask=dim_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # fp8 index K cache: widening cast with bf16/fp16 Q, no-op with fp8
+            # Q (fp8 attn-GEMM mode; tl.dot runs fp8x8). Compiled out for bf16.
+            k = k.to(q.dtype)
         # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
         v_off = (
             slots[:, None] * stride_v_s
@@ -378,11 +578,15 @@ def _decode_score_attn_kernel(
             mask=pos_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # Cast V to the compute dtype (widening for bf16/fp16 Q; no-op for
+            # fp8 Q where P is quantized to e4m3 for the fp8 PV MMA).
+            v = v.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * sm_scale_log2e
+        qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
         # save qk to score
         score = tl.reshape(
             qk,
@@ -412,13 +616,9 @@ def _decode_score_attn_kernel(
         )
         if SKIP_TRIVIAL_TOPK_SCORE:
             if num_blocks > topk:
-                tl.store(
-                    s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
-                )
+                tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), mask=s_ptrs_mask)
         else:
-            tl.store(
-                s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
-            )
+            tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), mask=s_ptrs_mask)
         # max-of-max == max(qk), avoids re-scanning qk
         m_ij = tl.maximum(m_i, tl.max(sub_max, axis=1))
         p = tl.exp2(qk - m_ij[:, None])
@@ -426,35 +626,48 @@ def _decode_score_attn_kernel(
         acc_o_scale = tl.exp2(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
         # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v)
+        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
         m_i = m_ij
         l_i = l_i * acc_o_scale + l_ij
         # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        s_ptrs_col = s_ptrs_col + BLOCKS_PER_K_BLOCK
+        s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+            score_ptr + pid_b * stride_s_b + pid_h * stride_s_h,
+            gqa_group_size,
+            chunk_end_block,
+            stride_s_h,
+            stride_s_n,
+            0,
+            s_ptrs_col,
+            BLOCK_SIZE_H,
+            BLOCKS_PER_K_BLOCK,
+        )
     # final scale
     acc_o = acc_o / l_i[:, None]
     # compute lse in log2 scale for merge kernel
     lse_i = m_i + tl.log2(l_i)
     # save output
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    o_ptrs, o_ptrs_mask = tile_ptrs_2d(
+        o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
+        gqa_group_size,
+        head_dim,
+        stride_o_h,
+        stride_o_d,
+        0,
+        0,
+        BLOCK_SIZE_H,
+        BLOCK_SIZE_D,
     )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), mask=o_ptrs_mask)
     # save lse (in log2 scale, will be used directly in merge kernel)
-    lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
-        shape=(gqa_group_size,),
-        strides=(stride_l_h,),
-        offsets=(0,),
-        block_shape=(BLOCK_SIZE_H,),
-        order=(0,),
+    lse_ptrs, lse_ptrs_mask = tile_ptrs_1d(
+        lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
+        gqa_group_size,
+        stride_l_h,
+        0,
+        BLOCK_SIZE_H,
     )
-    tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
+    tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), mask=lse_ptrs_mask)
 
 
 @triton.heuristics(
@@ -499,17 +712,20 @@ def _merge_attn_out_kernel(
     # ptrs
     off_c = tl.arange(0, NUM_KV_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(valid_chunks, head_dim),
-        strides=(stride_o_c, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(NUM_KV_CHUNKS, BLOCK_SIZE_D),
-        order=(1, 0),
+    o_ptrs, o_ptrs_mask = tile_ptrs_2d(
+        o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
+        valid_chunks,
+        head_dim,
+        stride_o_c,
+        stride_o_d,
+        0,
+        0,
+        NUM_KV_CHUNKS,
+        BLOCK_SIZE_D,
     )
     lse_ptrs = lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c
     # load o and lse
-    o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
+    o = tl.load(o_ptrs, mask=o_ptrs_mask, other=0.0)
     lse = tl.load(lse_ptrs, mask=off_c < valid_chunks, other=float("-inf"))
     # merge o (lse is in log2 scale, use exp2/log2 for efficiency)
     lse_shifted = lse - tl.max(lse, axis=0)
@@ -744,223 +960,55 @@ def _topk_index_merge_kernel(
         + pid_b * stride_tif_b
         + off_t * stride_tif_t
     )
-    topk_idx_final = tl.where(off_t < tl.minimum(topk, num_blocks), topk_idx_final, -1)
-    tl.store(tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty))
+    # Ascending by block id, -1 tail: the MSA fmha_sm100 consumer requires
+    # sorted kv_block_indexes (the bitonic pass above orders by score).
+    topk_idx_final = _sort_ids_ascending(
+        topk_idx_final, tl.minimum(topk, num_blocks), BLOCK_SIZE_T
+    )
+    tl.store(
+        tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=off_t < topk
+    )
 
 
-@torch.no_grad()
-def flash_decode_with_topk_idx(
-    q: torch.Tensor,  # [batch_size, num_heads, head_dim]
-    sink: Optional[torch.Tensor],
-    k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
-    v_cache: Optional[torch.Tensor],  # paged; ignored when disable_index_value=True
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    seq_lens: torch.Tensor,  # [batch_size, ]
-    max_seqlen: int,
-    slot_ids: torch.Tensor,  # [batch_size, ]
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
-    sm_scale: Optional[float] = None,
-    use_tma: bool = True,
-    score_type: str = "max",
-    disable_index_value: bool = False,
-    use_dense_main_attn: bool = False,  # NOTE: need transform idx in this case
-    page_size: int = 1,
-) -> torch.Tensor:
-    assert score_type in (
-        "max",
-        "lse",
-    ), f"score_type must be 'max' or 'lse', got {score_type!r}"
-    triton.set_allocator(robust_allocator)
-    # dtype check
-    assert (
-        q.dtype == torch.bfloat16
-        or q.dtype == torch.float16
-        and k_cache.dtype == q.dtype
-    )
-    if not disable_index_value:
-        assert v_cache is not None
-    # shape
-    batch_size, num_q_heads, head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
-    max_kv_len = req_to_token.shape[1]
-    assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
-    # gqa
-    assert num_q_heads % num_kv_heads == 0
-    gqa_group_size = num_q_heads // num_kv_heads
-    # sm scale
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
-    # NUM_KV_CHUNKS controls how many parallel chunks each (batch, kv_head) gets.
-    # Total CTAs = batch_size * NUM_KV_CHUNKS * num_kv_heads.
-    # TARGET_GRID is the desired total CTA count; NUM_KV_CHUNKS is derived by:
-    #   NUM_KV_CHUNKS = clamp(TARGET_GRID // (BS * num_kv_heads), 1, MAX_NUM_KV_CHUNKS)
-    # then rounded down to the nearest power of 2 (merge kernel requires it).
-    # Must only depend on cuda-graph-constant quantities (BS, num_kv_heads), not seq_len.
-    # Empty chunks early-return cheaply, so over-chunking is nearly free.
-    # E.g. with num_kv_heads=1: BS=1→NKC=256,CTAs=256; BS=32→NKC=128,CTAs=4096.
-    TARGET_GRID = 4096
-    MAX_NUM_KV_CHUNKS = 256
-    target = max(
-        1,
-        min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
-    )
-    NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
-    score_kv_len = min(max_seqlen, max_kv_len)
-    # The score producers below write every valid block column
-    # [0, ceil(seq_len / block_size)) for each (head, batch) row. All consumers
-    # clamp their scan to the same per-row valid block count, so columns beyond
-    # seq_len are never read. Avoid a full-tensor -inf memset here; on CUDA graph
-    # capture the static score shape can be much larger than the live context.
-    score = torch.empty(
-        (num_q_heads, batch_size, triton.cdiv(score_kv_len, block_size)),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    use_jit_topk = (
+def decode_topk_uses_jit(num_score_blocks: int, topk: int) -> bool:
+    return (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        and num_score_blocks <= _JIT_TOPK_MAX_NUM_BLOCKS
         and topk <= 32
     )
-    # If the live context has <= topk sparse blocks, the downstream dense
-    # page-table/JIT top-k kernels select every block from seq_lens directly
-    # without reading score. Keep this gate in sync with the consumers below:
-    # _skip_block_topk/use_dense_main_attn and use_jit_topk special-case
-    # num_blocks <= topk, while the Triton fallback reads score and must not
-    # skip these writes.
-    skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
 
-    grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
-    if disable_index_value:
-        _decode_score_kernel[grid](
-            q,
-            k_cache,
-            req_to_token,
-            score,
-            seq_lens,
-            slot_ids,
-            max_slots,
-            batch_size,
-            gqa_group_size,
-            head_dim,
-            block_size,
-            topk,
-            sm_scale,
-            init_blocks,
-            local_blocks,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_cache.stride(0),
-            k_cache.stride(1),
-            k_cache.stride(2),
-            req_to_token.stride(0),
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            NUM_KV_CHUNKS=NUM_KV_CHUNKS,
-            SCORE_TYPE=score_type,
-            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
-        )
-    else:
-        assert v_cache is not None
-        o = torch.empty(
-            NUM_KV_CHUNKS,
-            batch_size,
-            num_q_heads,
-            head_dim,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        lse = torch.empty(
-            NUM_KV_CHUNKS, batch_size, num_q_heads, dtype=torch.float32, device=q.device
-        )
-        _decode_score_attn_kernel[grid](
-            q,
-            sink,
-            k_cache,
-            v_cache,
-            req_to_token,
-            o,
-            lse,
-            score,
-            seq_lens,
-            slot_ids,
-            max_slots,
-            batch_size,
-            gqa_group_size,
-            head_dim,
-            block_size,
-            topk,
-            sm_scale,
-            init_blocks,
-            local_blocks,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            sink.stride(0) if sink is not None else 0,
-            sink.stride(1) if sink is not None else 0,
-            k_cache.stride(0),
-            k_cache.stride(1),
-            k_cache.stride(2),
-            v_cache.stride(0),
-            v_cache.stride(1),
-            v_cache.stride(2),
-            req_to_token.stride(0),
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-            o.stride(3),
-            lse.stride(0),
-            lse.stride(1),
-            lse.stride(2),
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            NUM_KV_CHUNKS=NUM_KV_CHUNKS,
-            SCORE_TYPE=score_type,
-            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
-        )
-    # Fused top-k + page-table transform: emit the dense backend's page table
-    # directly (page-size-aware) instead of block ids, skipping a separate gather.
-    # The page table + per-query effective KV length are allocated and returned.
-    real_seq_lens = None
-    if use_dense_main_attn:
-        from sglang.kernels.ops.attention.minimax_decode_topk import (
-            minimax_decode_topk_page_table,
-        )
 
-        # num_q_heads (= num index/kv heads) may be > 1 for DP attention; the
-        # kernel emits a flattened [batch*num_q_heads] page table + seq_lens with
-        # the kv head head-encoded (head-minor) into the page index.
-        topk_idx, real_seq_lens = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
-        )
-        if disable_index_value:
-            return None, topk_idx, real_seq_lens
-        # fall through to the idx_o (index value) merge, then return
-        _skip_block_topk = True
-    else:
-        _skip_block_topk = False
-
-    # get topk index
-    if not _skip_block_topk:
+def select_decode_topk(
+    *,
+    score: torch.Tensor,  # [num_q_heads, batch_size, max_seqblock]
+    seq_lens: torch.Tensor,
+    block_size: int,
+    topk: int,
+    use_jit_topk: bool,
+    out: Optional[torch.Tensor] = None,  # [num_q_heads, batch_size, topk] int32
+) -> torch.Tensor:
+    num_q_heads, batch_size, _ = score.shape
+    if out is None:
         topk_idx = torch.empty(
             (num_q_heads, batch_size, topk),
             device=score.device,
             dtype=torch.int32,
         )
-
-    if _skip_block_topk:
-        pass
-    elif use_jit_topk:
+    else:
+        assert out.shape == (num_q_heads, batch_size, topk)
+        assert out.dtype == torch.int32
+        topk_idx = out
+    if use_jit_topk:
         # Single-stage JIT radix-select: one kernel, no intermediate buffers.
         # Equivalent output to the 2-stage path (set of block ids, front-packed,
         # -1 padded); ~2-16x faster for long context. See
         # sglang/kernels/ops/attention/minimax_decode_topk.py.
-        from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+        if is_xpu():
+            from sgl_kernel import minimax_decode_topk
+        else:
+            from sglang.kernels.ops.attention.minimax_decode_topk import (
+                minimax_decode_topk,
+            )
 
         minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
     else:
@@ -999,7 +1047,6 @@ def flash_decode_with_topk_idx(
             dtype=torch.int32,
             device=score.device,
         )
-        # stream 0 (default): topk partial → topk merge
         grid = (batch_size, num_q_heads, NUM_TOPK_CHUNKS)
         _topk_index_partial_kernel[grid](
             score,
@@ -1041,6 +1088,264 @@ def flash_decode_with_topk_idx(
             topk_idx.stride(1),
             topk_idx.stride(2),
             NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
+        )
+    return topk_idx
+
+
+@torch.no_grad()
+def flash_decode_with_topk_idx(
+    q: torch.Tensor,  # [batch_size, num_heads, head_dim]
+    sink: Optional[torch.Tensor],
+    k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
+    v_cache: Optional[torch.Tensor],  # paged; ignored when disable_index_value=True
+    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
+    seq_lens: torch.Tensor,  # [batch_size, ]
+    max_seqlen: int,
+    slot_ids: torch.Tensor,  # [batch_size, ]
+    block_size: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    sm_scale: Optional[float] = None,
+    score_type: str = "max",
+    disable_index_value: bool = False,
+    use_dense_main_attn: bool = False,  # NOTE: need transform idx in this case
+    page_size: int = 1,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+) -> torch.Tensor:
+    assert score_type in (
+        "max",
+        "lse",
+    ), f"score_type must be 'max' or 'lse', got {score_type!r}"
+    triton.set_allocator(robust_allocator)
+    # dtype check (v_cache is None under disable_index_value)
+    is_fp8 = check_sparse_kv_fp8(
+        q, k_cache, None if disable_index_value else v_cache, label="decode indexer"
+    )
+    k_scale = unit_scale(k_scale)
+    v_scale = unit_scale(v_scale)
+    if not disable_index_value:
+        assert v_cache is not None
+    # shape
+    batch_size, num_q_heads, head_dim = q.shape
+    max_slots, num_kv_heads, _ = k_cache.shape
+    max_kv_len = req_to_token.shape[1]
+    assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
+    # gqa
+    assert num_q_heads % num_kv_heads == 0
+    gqa_group_size = num_q_heads // num_kv_heads
+    # sm scale
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+    # q_scale folds exactly into sm_scale: it multiplies every Q-side logit —
+    # the QK dot AND the sink logit — unlike k_scale, which must not touch the
+    # sink term and therefore stays a separate kernel argument.
+    sm_scale = sm_scale * unit_scale(q_scale)
+    # NUM_KV_CHUNKS controls how many parallel chunks each (batch, kv_head) gets.
+    # Total CTAs = batch_size * NUM_KV_CHUNKS * num_kv_heads.
+    # TARGET_GRID is the desired total CTA count; NUM_KV_CHUNKS is derived by:
+    #   NUM_KV_CHUNKS = clamp(TARGET_GRID // (BS * num_kv_heads), 1, MAX_NUM_KV_CHUNKS)
+    # then rounded down to the nearest power of 2 (merge kernel requires it).
+    # Must only depend on cuda-graph-constant quantities (BS, num_kv_heads), not seq_len.
+    # Empty chunks early-return cheaply, so over-chunking is nearly free.
+    # E.g. with num_kv_heads=1: BS=1→NKC=256,CTAs=256; BS=32→NKC=128,CTAs=4096.
+    TARGET_GRID = 4096
+    MAX_NUM_KV_CHUNKS = 256
+    target = max(
+        1,
+        min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
+    )
+    NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
+    score_kv_len = min(max_seqlen, max_kv_len)
+    # The score producers below write every valid block column
+    # [0, ceil(seq_len / block_size)) for each (head, batch) row. All consumers
+    # clamp their scan to the same per-row valid block count, so columns beyond
+    # seq_len are never read. Avoid a full-tensor -inf memset here; on CUDA graph
+    # capture the static score shape can be much larger than the live context.
+    score = torch.empty(
+        (num_q_heads, batch_size, triton.cdiv(score_kv_len, block_size)),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    use_jit_topk = decode_topk_uses_jit(score.shape[2], topk)
+    # If the live context has <= topk sparse blocks, the downstream dense
+    # page-table/JIT top-k kernels select every block from seq_lens directly
+    # without reading score. Keep this gate in sync with the consumers below:
+    # _skip_block_topk/use_dense_main_attn and use_jit_topk special-case
+    # num_blocks <= topk, while the Triton fallback reads score and must not
+    # skip these writes.
+    skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
+
+    grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
+    if disable_index_value and page_size % block_size == 0 and get_platform().is_sm90:
+        paged_chunks = 1 << (
+            max(
+                1, min(1024, TARGET_GRID // max(1, batch_size * num_kv_heads))
+            ).bit_length()
+            - 1
+        )
+        _decode_score_paged_kernel[(batch_size * paged_chunks, num_kv_heads)](
+            q,
+            k_cache,
+            req_to_token,
+            score,
+            seq_lens,
+            slot_ids,
+            max_slots,
+            batch_size,
+            gqa_group_size,
+            head_dim,
+            block_size,
+            topk,
+            sm_scale,
+            k_scale,
+            init_blocks,
+            local_blocks,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            req_to_token.stride(0),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            BLOCK_SIZE_H=max(16, triton.next_power_of_2(gqa_group_size)),
+            BLOCK_SIZE_D=triton.next_power_of_2(head_dim),
+            NUM_KV_CHUNKS=paged_chunks,
+            SCORE_TYPE=score_type,
+            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
+            num_warps=4 if batch_size <= 2 else 2,
+            num_stages=3,
+        )
+    elif disable_index_value:
+        _decode_score_kernel[grid](
+            q,
+            k_cache,
+            req_to_token,
+            score,
+            seq_lens,
+            slot_ids,
+            max_slots,
+            batch_size,
+            gqa_group_size,
+            head_dim,
+            block_size,
+            topk,
+            sm_scale,
+            k_scale,
+            init_blocks,
+            local_blocks,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            req_to_token.stride(0),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            NUM_KV_CHUNKS=NUM_KV_CHUNKS,
+            SCORE_TYPE=score_type,
+            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
+        )
+    else:
+        assert v_cache is not None
+        o = torch.empty(
+            NUM_KV_CHUNKS,
+            batch_size,
+            num_q_heads,
+            head_dim,
+            dtype=sparse_out_dtype(q),
+            device=q.device,
+        )
+        lse = torch.empty(
+            NUM_KV_CHUNKS, batch_size, num_q_heads, dtype=torch.float32, device=q.device
+        )
+        _decode_score_attn_kernel[grid](
+            q,
+            sink,
+            k_cache,
+            v_cache,
+            req_to_token,
+            o,
+            lse,
+            score,
+            seq_lens,
+            slot_ids,
+            max_slots,
+            batch_size,
+            gqa_group_size,
+            head_dim,
+            block_size,
+            topk,
+            sm_scale,
+            k_scale,
+            v_scale,
+            init_blocks,
+            local_blocks,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            sink.stride(0) if sink is not None else 0,
+            sink.stride(1) if sink is not None else 0,
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            req_to_token.stride(0),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            lse.stride(0),
+            lse.stride(1),
+            lse.stride(2),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            NUM_KV_CHUNKS=NUM_KV_CHUNKS,
+            SCORE_TYPE=score_type,
+            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
+        )
+    # Fused top-k + page-table transform: emit the dense backend's page table
+    # directly (page-size-aware) instead of block ids, skipping a separate gather.
+    # The page table + per-query effective KV length are allocated and returned.
+    real_seq_lens = None
+    if use_dense_main_attn:
+        from sglang.kernels.ops.attention.minimax_decode_topk import (
+            minimax_decode_topk_page_table,
+        )
+
+        # num_q_heads (= num index/kv heads) may be > 1 for DP attention; the
+        # kernel emits a flattened [batch*num_q_heads] page table + seq_lens with
+        # the kv head head-encoded (head-minor) into the page index.
+        topk_idx, real_seq_lens = minimax_decode_topk_page_table(
+            score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
+        )
+        if disable_index_value:
+            return None, topk_idx, real_seq_lens
+        # fall through to the idx_o (index value) merge, then return
+        _skip_block_topk = True
+    else:
+        _skip_block_topk = False
+
+    if not _skip_block_topk:
+        topk_idx = select_decode_topk(
+            score=score,
+            seq_lens=seq_lens,
+            block_size=block_size,
+            topk=topk,
+            use_jit_topk=use_jit_topk,
         )
     if disable_index_value:
         return None, topk_idx, real_seq_lens

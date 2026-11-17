@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    if get_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
@@ -187,7 +187,7 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if get_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
@@ -272,8 +272,14 @@ def try_get_optimal_moe_config(
     per_channel_quant: bool = False,
     return_down_config: bool = False,
 ):
-    from sglang.srt.layers.moe.moe_runner.triton_utils import get_config
+    from sglang.srt.layers.moe.moe_runner.triton_utils import (
+        get_config,
+        get_config_lookup,
+    )
 
+    lookup = get_config_lookup()
+    if lookup is not None:
+        M, top_k = lookup
     down_config = None
     max_block_m = None
     override_config = get_config()

@@ -1,6 +1,6 @@
 """fused_decode_sconv_metadata must be bit-identical to the unfused prep.
 
-The unfused reference is the exact op sequence `_prepare_decode_sconv_metadata`
+The unfused reference is the exact op sequence the decode metadata prep
 used to launch: two arange calls + ones + precompute_helion_decode_metadata
 (!= PAD, &, clamp, long, arange x2).
 """
@@ -15,7 +15,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
